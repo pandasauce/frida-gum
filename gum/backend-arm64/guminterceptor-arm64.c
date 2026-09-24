@@ -662,6 +662,7 @@ gum_interceptor_backend_prepare_trampoline (GumInterceptorBackend * self,
       (ctx->scenario == GUM_INTERCEPTOR_SCENARIO_OFFLINE)
       ? GUM_SCENARIO_OFFLINE
       : GUM_SCENARIO_ONLINE;
+  gboolean full_redirect_possible;
   guint redirect_limit;
 
   *need_deflector = FALSE;
@@ -701,9 +702,29 @@ gum_interceptor_backend_prepare_trampoline (GumInterceptorBackend * self,
     return TRUE;
   }
 
-  if (gum_arm64_relocator_can_relocate_within (function_address,
-        GUM_INTERCEPTOR_FULL_REDIRECT_SIZE, scenario, ctx->relocation_policy,
-        code_range, &redirect_limit, &data->scratch_reg))
+  full_redirect_possible = gum_arm64_relocator_can_relocate_within (
+      function_address, GUM_INTERCEPTOR_FULL_REDIRECT_SIZE, scenario,
+      ctx->relocation_policy, code_range, &redirect_limit, &data->scratch_reg);
+
+#ifdef HAVE_LINUX
+  if (ctx->type == GUM_INTERCEPTOR_TYPE_DEFAULT && redirect_limit >= 8 &&
+      data->scratch_reg != ARM64_REG_INVALID)
+  {
+    GumAddressSpec spec;
+
+    spec.near_address = function_address;
+    spec.max_distance = GUM_ARM64_B_MAX_DISTANCE;
+    ctx->trampoline_slice = gum_code_allocator_try_alloc_slice_near (
+        self->allocator, &spec, 0);
+    if (ctx->trampoline_slice != NULL)
+    {
+      data->redirect_code_size = 4;
+      return TRUE;
+    }
+  }
+#endif
+
+  if (full_redirect_possible)
   {
     data->redirect_code_size = GUM_INTERCEPTOR_FULL_REDIRECT_SIZE;
 
@@ -1225,6 +1246,8 @@ _gum_interceptor_backend_deactivate_trampoline (GumInterceptorBackend * self,
                                                 GumFunctionContext * ctx,
                                                 gpointer prologue)
 {
+  GumArm64FunctionContextData * data = GUM_FCDATA (ctx);
+
 #ifdef HAVE_DARWIN
   if (ctx->grafted_hook != NULL)
   {
@@ -1239,8 +1262,15 @@ _gum_interceptor_backend_deactivate_trampoline (GumInterceptorBackend * self,
   }
 #endif
 
-  gum_memcpy (prologue, ctx->overwritten_prologue,
-      ctx->overwritten_prologue_len);
+  if (data->redirect_code_size == 4)
+  {
+    *((guint32 *) prologue) = *((guint32 *) ctx->overwritten_prologue);
+  }
+  else
+  {
+    gum_memcpy (prologue, ctx->overwritten_prologue,
+        ctx->overwritten_prologue_len);
+  }
 }
 
 gpointer
