@@ -31,6 +31,7 @@ struct _GumCodeAllocator
   GList * free_slices;
 
   GSList * dispatchers;
+  GSList * deflector_pages;
 };
 
 struct _GumCodeSlice

@@ -37,8 +37,13 @@
 # define GUM_MAX_CODE_DEFLECTOR_THUNK_SIZE 64
 #endif
 
+#if defined (HAVE_ELF) && defined (HAVE_ARM64)
+# define GUM_CODE_DEFLECTOR_USES_ALLOCATED_SLOTS
+#endif
+
 typedef struct _GumCodePages GumCodePages;
 typedef struct _GumCodeSliceElement GumCodeSliceElement;
+typedef struct _GumCodeDeflectorPage GumCodeDeflectorPage;
 typedef struct _GumCodeDeflectorDispatcher GumCodeDeflectorDispatcher;
 typedef struct _GumCodeDeflectorImpl GumCodeDeflectorImpl;
 typedef struct _GumProbeRangeForCodeCaveContext GumProbeRangeForCodeCaveContext;
@@ -64,11 +69,24 @@ struct _GumCodePages
   GumCodeSliceElement elements[1];
 };
 
+struct _GumCodeDeflectorPage
+{
+  GumCodeAllocator * allocator;
+
+  gpointer address;
+  gsize size;
+
+  guint slot_count;
+  guint used_slot_count;
+  gboolean slot_is_used[1];
+};
+
 struct _GumCodeDeflectorDispatcher
 {
   GSList * callers;
 
   gpointer address;
+  GumCodeDeflectorPage * page;
 
   gpointer original_data;
   gsize original_size;
@@ -113,8 +131,8 @@ static gboolean gum_code_slice_is_aligned (const GumCodeSlice * slice,
     gsize alignment);
 
 static GumCodeDeflectorDispatcher * gum_code_deflector_dispatcher_new (
-    const GumAddressSpec * caller, gpointer return_address,
-    gpointer dedicated_target);
+    GumCodeAllocator * allocator, const GumAddressSpec * caller,
+    gpointer return_address, gpointer dedicated_target);
 static void gum_code_deflector_dispatcher_free (
     GumCodeDeflectorDispatcher * dispatcher);
 static void gum_insert_deflector (gpointer cave,
@@ -128,6 +146,18 @@ static gpointer gum_code_deflector_dispatcher_lookup (
 
 static gboolean gum_probe_module_for_code_cave (GumModule * module,
     gpointer user_data);
+
+#ifdef GUM_CODE_DEFLECTOR_USES_ALLOCATED_SLOTS
+static gpointer gum_code_allocator_take_deflector_slot (
+    GumCodeAllocator * self, const GumAddressSpec * caller,
+    GumCodeDeflectorPage ** page);
+static GumCodeDeflectorPage * gum_code_deflector_page_new (
+    GumCodeAllocator * allocator, const GumAddressSpec * caller);
+static gpointer gum_code_deflector_page_try_take_slot (
+    GumCodeDeflectorPage * self, const GumAddressSpec * caller);
+static void gum_code_deflector_page_release_slot (GumCodeDeflectorPage * self,
+    gpointer slot);
+#endif
 
 G_DEFINE_BOXED_TYPE (GumCodeSlice, gum_code_slice, gum_code_slice_ref,
                      gum_code_slice_unref)
@@ -150,6 +180,7 @@ gum_code_allocator_init (GumCodeAllocator * allocator,
   allocator->free_slices = NULL;
 
   allocator->dispatchers = NULL;
+  allocator->deflector_pages = NULL;
 }
 
 void
@@ -499,8 +530,8 @@ gum_code_allocator_alloc_deflector (GumCodeAllocator * self,
 
   if (dispatcher == NULL)
   {
-    dispatcher = gum_code_deflector_dispatcher_new (caller, return_address,
-        dedicated ? target : NULL);
+    dispatcher = gum_code_deflector_dispatcher_new (self, caller,
+        return_address, dedicated ? target : NULL);
     if (dispatcher == NULL)
       return NULL;
     self->dispatchers = g_slist_prepend (self->dispatchers, dispatcher);
@@ -570,18 +601,40 @@ gum_code_deflector_unref (GumCodeDeflector * deflector)
 }
 
 static GumCodeDeflectorDispatcher *
-gum_code_deflector_dispatcher_new (const GumAddressSpec * caller,
+gum_code_deflector_dispatcher_new (GumCodeAllocator * allocator,
+                                   const GumAddressSpec * caller,
                                    gpointer return_address,
                                    gpointer dedicated_target)
 {
-#if defined (HAVE_DARWIN) || (defined (HAVE_ELF) && GLIB_SIZEOF_VOID_P == 4)
+#if defined (HAVE_DARWIN) || \
+    (defined (HAVE_ELF) && GLIB_SIZEOF_VOID_P == 4) || \
+    defined (GUM_CODE_DEFLECTOR_USES_ALLOCATED_SLOTS)
   GumCodeDeflectorDispatcher * dispatcher;
+#ifdef GUM_CODE_DEFLECTOR_USES_ALLOCATED_SLOTS
+  GumCodeDeflectorPage * page;
+  gpointer slot;
+#else
   GumProbeRangeForCodeCaveContext probe_ctx;
+#endif
   GumInsertDeflectorContext insert_ctx;
   gboolean remap_supported;
 
   remap_supported = gum_memory_can_remap_writable ();
 
+#ifdef GUM_CODE_DEFLECTOR_USES_ALLOCATED_SLOTS
+  (void) gum_probe_module_for_code_cave;
+  (void) gum_remove_deflector;
+
+  slot = gum_code_allocator_take_deflector_slot (allocator, caller, &page);
+  if (slot == NULL)
+    return NULL;
+
+  dispatcher = g_slice_new0 (GumCodeDeflectorDispatcher);
+
+  dispatcher->address = slot;
+  dispatcher->page = page;
+  dispatcher->original_size = GUM_CODE_DEFLECTOR_CAVE_SIZE;
+#else
   probe_ctx.caller = caller;
 
   probe_ctx.cave.base_address = 0;
@@ -599,6 +652,7 @@ gum_code_deflector_dispatcher_new (const GumAddressSpec * caller,
   dispatcher->original_data = g_memdup (dispatcher->address,
       probe_ctx.cave.size);
   dispatcher->original_size = probe_ctx.cave.size;
+#endif
 
   if (dedicated_target == NULL)
   {
@@ -633,6 +687,7 @@ gum_code_deflector_dispatcher_new (const GumAddressSpec * caller,
 
   return dispatcher;
 #else
+  (void) allocator;
   (void) gum_insert_deflector;
   (void) gum_write_thunk;
   (void) gum_probe_module_for_code_cave;
@@ -644,8 +699,12 @@ gum_code_deflector_dispatcher_new (const GumAddressSpec * caller,
 static void
 gum_code_deflector_dispatcher_free (GumCodeDeflectorDispatcher * dispatcher)
 {
+#ifdef GUM_CODE_DEFLECTOR_USES_ALLOCATED_SLOTS
+  gum_code_deflector_page_release_slot (dispatcher->page, dispatcher->address);
+#else
   gum_memory_patch_code (dispatcher->address, dispatcher->original_size,
       (GumMemoryPatchApplyFunc) gum_remove_deflector, dispatcher);
+#endif
 
   if (dispatcher->thunk != NULL)
   {
@@ -908,3 +967,123 @@ gum_probe_module_for_code_cave (GumModule * module,
   ctx->cave.size = sizeof (empty_cave);
   return FALSE;
 }
+
+#ifdef GUM_CODE_DEFLECTOR_USES_ALLOCATED_SLOTS
+
+static gpointer
+gum_code_allocator_take_deflector_slot (GumCodeAllocator * self,
+                                        const GumAddressSpec * caller,
+                                        GumCodeDeflectorPage ** page)
+{
+  GSList * cur;
+  GumCodeDeflectorPage * new_page;
+
+  for (cur = self->deflector_pages; cur != NULL; cur = cur->next)
+  {
+    gpointer slot;
+
+    slot = gum_code_deflector_page_try_take_slot (cur->data, caller);
+    if (slot != NULL)
+    {
+      *page = cur->data;
+      return slot;
+    }
+  }
+
+  new_page = gum_code_deflector_page_new (self, caller);
+  if (new_page == NULL)
+    return NULL;
+
+  *page = new_page;
+  return gum_code_deflector_page_try_take_slot (new_page, caller);
+}
+
+static GumCodeDeflectorPage *
+gum_code_deflector_page_new (GumCodeAllocator * allocator,
+                             const GumAddressSpec * caller)
+{
+  GumCodeDeflectorPage * page;
+  gsize page_size;
+  guint slot_count;
+  gpointer address;
+  GumMemoryRange range;
+
+  page_size = gum_query_page_size ();
+
+  address = gum_memory_allocate_near (caller, page_size, page_size,
+      gum_memory_can_remap_writable () ? GUM_PAGE_RX : GUM_PAGE_RW);
+  if (address == NULL)
+    return NULL;
+
+  range.base_address = GUM_ADDRESS (address);
+  range.size = page_size;
+  gum_cloak_add_range (&range);
+
+  slot_count = page_size / GUM_CODE_DEFLECTOR_CAVE_SIZE;
+
+  page = g_malloc0 (G_STRUCT_OFFSET (GumCodeDeflectorPage, slot_is_used) +
+      (slot_count * sizeof (gboolean)));
+  page->allocator = allocator;
+  page->address = address;
+  page->size = page_size;
+  page->slot_count = slot_count;
+
+  allocator->deflector_pages =
+      g_slist_prepend (allocator->deflector_pages, page);
+
+  return page;
+}
+
+static gpointer
+gum_code_deflector_page_try_take_slot (GumCodeDeflectorPage * self,
+                                       const GumAddressSpec * caller)
+{
+  guint i;
+
+  for (i = 0; i != self->slot_count; i++)
+  {
+    guint8 * slot = (guint8 *) self->address +
+        (i * GUM_CODE_DEFLECTOR_CAVE_SIZE);
+
+    if (self->slot_is_used[i] ||
+        !gum_address_spec_is_satisfied_by (caller, slot))
+      continue;
+
+    self->slot_is_used[i] = TRUE;
+    self->used_slot_count++;
+
+    return slot;
+  }
+
+  return NULL;
+}
+
+static void
+gum_code_deflector_page_release_slot (GumCodeDeflectorPage * self,
+                                      gpointer slot)
+{
+  GumCodeAllocator * allocator = self->allocator;
+  guint slot_index;
+  GumMemoryRange range;
+
+  slot_index = ((guint8 *) slot - (guint8 *) self->address) /
+      GUM_CODE_DEFLECTOR_CAVE_SIZE;
+  self->slot_is_used[slot_index] = FALSE;
+  self->used_slot_count--;
+
+  if (self->used_slot_count != 0)
+    return;
+
+  allocator->deflector_pages =
+      g_slist_remove (allocator->deflector_pages, self);
+
+  gum_memory_release (self->address, self->size);
+
+  range.base_address = GUM_ADDRESS (self->address);
+  range.size = self->size;
+  gum_cloak_remove_range (&range);
+
+  g_free (self);
+}
+
+#endif
