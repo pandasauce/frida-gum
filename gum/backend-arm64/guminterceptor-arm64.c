@@ -70,6 +70,7 @@ struct _GumEmitThunksContext
 struct _GumArm64FunctionContextData
 {
   guint redirect_code_size;
+  guint min_reloc_bytes;
   arm64_reg scratch_reg;
   guint available_space;
 };
@@ -667,6 +668,7 @@ gum_interceptor_backend_prepare_trampoline (GumInterceptorBackend * self,
 
   *need_deflector = FALSE;
 
+  data->min_reloc_bytes = 0;
   data->scratch_reg = ctx->scratch_register;
 
   if (ctx->write_redirect != NULL)
@@ -718,7 +720,12 @@ gum_interceptor_backend_prepare_trampoline (GumInterceptorBackend * self,
         self->allocator, &spec, 0);
     if (ctx->trampoline_slice != NULL)
     {
+      /* Relocate what the longer redirect would have, so create_trampoline
+       * still recognizes LR-reading thunks and rewrites their LR read. */
       data->redirect_code_size = 4;
+      data->min_reloc_bytes = full_redirect_possible
+          ? GUM_INTERCEPTOR_FULL_REDIRECT_SIZE
+          : 8;
       return TRUE;
     }
   }
@@ -966,7 +973,7 @@ _gum_interceptor_backend_create_trampoline (GumInterceptorBackend * self,
       g_string_append_c (signature, ';');
     g_string_append (signature, insn->mnemonic);
   }
-  while (reloc_bytes < data->redirect_code_size);
+  while (reloc_bytes < MAX (data->redirect_code_size, data->min_reloc_bytes));
 
   if (!gum_arm64_relocator_read_until_resumable (ar, scenario) && !force)
   {
